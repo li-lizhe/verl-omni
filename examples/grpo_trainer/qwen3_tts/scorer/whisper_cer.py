@@ -20,6 +20,7 @@ import argparse
 import base64
 import binascii
 import json
+import logging
 import re
 import threading
 import unicodedata
@@ -30,6 +31,69 @@ from typing import Any
 import numpy as np
 
 __all__ = ["WhisperCERScorer"]
+
+logger = logging.getLogger(__name__)
+
+# Device types that expose a torch.<device>.is_available() probe, in preference order.
+_ACCELERATOR_DEVICE_TYPES = ("cuda", "npu", "xpu", "mps")
+
+
+def resolve_auto_device(torch_module: Any) -> str:
+    """Resolve ``--device auto`` to the best available accelerator, else ``cpu``.
+
+    ``torch.cuda.is_available()`` is ``False`` on non-CUDA accelerators such as
+    Ascend NPU, so probing CUDA alone silently selects CPU. That fallback then
+    trips the float16 guard in :class:`WhisperCERScorer` and the default
+    ``--device auto --dtype float16`` invocation cannot start at all.
+    """
+    accelerator = getattr(torch_module, "accelerator", None)
+    if accelerator is not None:
+        try:
+            current = accelerator.current_accelerator()
+        except Exception:  # Some torch builds raise instead of returning None.
+            current = None
+        current_type = getattr(current, "type", None)
+        if current_type is not None and current_type != "cpu":
+            return f"{current_type}:0"
+    for device_type in _ACCELERATOR_DEVICE_TYPES:
+        backend = getattr(torch_module, device_type, None)
+        if backend is None:
+            continue
+        try:
+            available = bool(backend.is_available())
+        except Exception:  # Defensive: an unavailable backend may still raise.
+            available = False
+        if available:
+            return f"{device_type}:0"
+    return "cpu"
+
+
+def linear_resample(samples: Any, source_rate: int, target_rate: int) -> Any:
+    """Linearly resample a 1-D waveform on the samples' own device.
+
+    Used only when ``torchaudio`` is unavailable (Ascend/aarch64 hosts often ship
+    torch without a matching torchaudio wheel), so the scorer degrades instead of
+    failing to import. Kept in the input dtype on purpose: Ascend NPU lacks
+    float64 support.
+    """
+    import torch
+
+    if source_rate == target_rate or samples.shape[-1] < 2:
+        return samples
+    target_length = int(samples.shape[-1] * target_rate / source_rate + 0.5)
+    if target_length <= 0:
+        return samples[:0]
+    positions = torch.linspace(
+        0.0,
+        samples.shape[-1] - 1,
+        target_length,
+        device=samples.device,
+        dtype=samples.dtype,
+    )
+    lower = positions.floor().long().clamp(max=samples.shape[-1] - 1)
+    upper = (lower + 1).clamp(max=samples.shape[-1] - 1)
+    weight = positions - lower.to(samples.dtype)
+    return samples[lower] * (1.0 - weight) + samples[upper] * weight
 
 
 class WhisperCERScorer:
@@ -55,7 +119,7 @@ class WhisperCERScorer:
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
         if device == "auto":
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            device = resolve_auto_device(torch)
         dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
         if dtype not in dtype_map:
             raise ValueError(f"Unsupported dtype: {dtype!r}.")
@@ -83,11 +147,21 @@ class WhisperCERScorer:
 
     def transcribe(self, waveform: np.ndarray, sample_rate: int) -> str:
         import torch
-        import torchaudio.functional as audio_functional
+
+        try:
+            import torchaudio.functional as audio_functional
+        except ImportError:
+            # Ascend/aarch64 hosts ship torch builds without a matching torchaudio
+            # wheel, so a hard dependency would make this scorer unusable there.
+            audio_functional = None
+            logger.warning("torchaudio is unavailable; falling back to linear resampling.")
 
         samples = torch.from_numpy(waveform)
         if sample_rate != 16_000:
-            samples = audio_functional.resample(samples, sample_rate, 16_000)
+            if audio_functional is not None:
+                samples = audio_functional.resample(samples, sample_rate, 16_000)
+            else:
+                samples = linear_resample(samples, sample_rate, 16_000)
         features = self.processor(
             samples.numpy(),
             sampling_rate=16_000,
@@ -239,7 +313,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local Whisper checkpoint or Hugging Face model ID")
     parser.add_argument("--revision", default=None)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "Device for Whisper; 'auto' picks the first available accelerator "
+            "(CUDA / Ascend NPU / XPU / MPS) and falls back to CPU."
+        ),
+    )
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--language", default="hi")
     parser.add_argument("--host", default="127.0.0.1")

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 
 @pytest.fixture(scope="module")
@@ -135,3 +136,72 @@ def test_http_server_implements_audio_json_contract(scorer):
         thread.join(timeout=2)
 
     assert result == {"score": 0.25, "sample_rate": 16_000, "prompt": "सही"}
+
+
+class _FakeDeviceType:
+    def __init__(self, device_type):
+        self.type = device_type
+
+
+class _FakeAccelerator:
+    def __init__(self, current):
+        self._current = current
+
+    def current_accelerator(self):
+        return self._current
+
+
+class _FakeBackend:
+    def __init__(self, available):
+        self._available = available
+
+    def is_available(self):
+        return self._available
+
+
+class _ExplodingBackend:
+    def is_available(self):
+        raise RuntimeError("driver missing")
+
+
+def _fake_torch(accelerator=None, **backends):
+    attributes = {name: _FakeBackend(available) for name, available in backends.items()}
+    if accelerator is not None:
+        attributes["accelerator"] = accelerator
+    return type("FakeTorch", (), attributes)()
+
+
+@pytest.mark.parametrize(
+    ("torch_module", "expected"),
+    [
+        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"))), "npu:0"),
+        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cpu")), cuda=False, npu=True), "npu:0"),
+        (_fake_torch(cuda=True, npu=True), "cuda:0"),
+        (_fake_torch(cuda=False, npu=False, xpu=True), "xpu:0"),
+        (_fake_torch(cuda=False, npu=False), "cpu"),
+    ],
+)
+def test_auto_device_uses_a_non_cuda_accelerator(scorer, torch_module, expected):
+    """Probing CUDA alone resolves to CPU on Ascend NPU, which then rejects float16."""
+    assert scorer.resolve_auto_device(torch_module) == expected
+
+
+def test_auto_device_falls_back_to_cpu_when_a_probe_raises(scorer):
+    torch_module = _fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cpu")), npu=False)
+    torch_module.cuda = _ExplodingBackend()
+
+    assert scorer.resolve_auto_device(torch_module) == "cpu"
+
+
+def test_linear_resample_keeps_the_duration_and_interpolates_linearly(scorer):
+    samples = torch.arange(9, dtype=torch.float32)
+
+    upsampled = scorer.linear_resample(samples, 8_000, 16_000)
+    assert upsampled.shape == (18,)
+    torch.testing.assert_close(upsampled, torch.linspace(0.0, 8.0, 18))
+
+    downsampled = scorer.linear_resample(samples, 16_000, 8_000)
+    assert downsampled.shape == (5,)
+    torch.testing.assert_close(downsampled, torch.linspace(0.0, 8.0, 5))
+
+    assert scorer.linear_resample(samples, 16_000, 16_000) is samples
