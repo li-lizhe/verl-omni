@@ -82,6 +82,26 @@ def test_audio_protocol_fails_closed_on_length_mismatch(scorer):
         scorer.decode_request(payload)
 
 
+def test_audio_protocol_rejects_an_implausible_sample_rate(scorer):
+    """A rate above the highest standard capture rate must be refused, so the
+    resampling ratio cannot be used to ask for an unbounded allocation."""
+    waveform = np.ones(160, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        scorer.decode_request(_request(waveform, sample_rate=384_001))
+    with pytest.raises(ValueError, match="must not exceed"):
+        scorer.decode_request(_request(waveform, sample_rate=1_000_000))
+
+
+def test_audio_protocol_accepts_the_highest_standard_sample_rate(scorer):
+    waveform = np.ones(160, dtype=np.float32)
+
+    decoded, sample_rate, _, _ = scorer.decode_request(_request(waveform, sample_rate=384_000))
+
+    assert sample_rate == 384_000
+    assert decoded.size == 160
+
+
 def test_audio_protocol_requires_metadata(scorer):
     payload = _request(np.ones(160, dtype=np.float32))
     del payload["metadata"]

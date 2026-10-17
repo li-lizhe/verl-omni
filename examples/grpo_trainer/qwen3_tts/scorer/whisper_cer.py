@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 # Device types that expose a torch.<device>.is_available() probe, in preference order.
 _ACCELERATOR_DEVICE_TYPES = ("cuda", "npu", "xpu", "mps")
 
+# Highest accepted input sample rate. Above any real capture rate (the highest
+# standard rates are 192 kHz and 384 kHz) and it bounds the resampling ratio: at
+# 8 MiB of float32 input the largest accepted rate still yields ~24x fewer than
+# 51 M output samples, instead of a sample_rate of 1 asking for ~16 G of them.
+_MAX_SAMPLE_RATE = 384_000
+
 
 def resolve_auto_device(torch_module: Any) -> str:
     """Resolve ``--device auto`` to the best available accelerator, else ``cpu``.
@@ -106,7 +112,7 @@ def linear_resample(samples: Any, source_rate: int, target_rate: int) -> Any:
 
     if source_rate == target_rate or samples.shape[-1] < 2:
         return samples
-    target_length = int(samples.shape[-1] * target_rate / source_rate + 0.5)
+    target_length = (samples.shape[-1] * target_rate + source_rate // 2) // source_rate
     if target_length <= 0:
         return samples[:0]
     positions = torch.linspace(
@@ -272,6 +278,11 @@ def decode_request(payload: Any) -> tuple[np.ndarray, int, str, dict]:
     sample_rate = payload.get("sample_rate")
     if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
         raise ValueError(f"sample_rate must be a positive integer, got {sample_rate!r}.")
+    if sample_rate > _MAX_SAMPLE_RATE:
+        raise ValueError(
+            f"sample_rate must not exceed {_MAX_SAMPLE_RATE} Hz (the highest standard capture "
+            f"rate), got {sample_rate!r}."
+        )
     if not np.isfinite(waveform).all():
         raise ValueError("Decoded waveform contains NaN or infinity.")
 
