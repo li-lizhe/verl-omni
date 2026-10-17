@@ -82,24 +82,34 @@ def test_audio_protocol_fails_closed_on_length_mismatch(scorer):
         scorer.decode_request(payload)
 
 
-def test_audio_protocol_rejects_an_implausible_sample_rate(scorer):
-    """A rate above the highest standard capture rate must be refused, so the
-    resampling ratio cannot be used to ask for an unbounded allocation."""
+def test_audio_protocol_rejects_a_sample_rate_below_the_supported_floor(scorer):
+    """The floor is what bounds the resampling ratio: a rate of 1 Hz would ask
+    for thousands of output samples per input sample."""
     waveform = np.ones(160, dtype=np.float32)
 
-    with pytest.raises(ValueError, match="must not exceed"):
+    for rate in (1, 1_000, 7_999):
+        with pytest.raises(ValueError, match="between 8000 and 384000"):
+            scorer.decode_request(_request(waveform, sample_rate=rate))
+
+
+def test_audio_protocol_rejects_a_sample_rate_above_the_supported_ceiling(scorer):
+    """The ceiling keeps the accepted contract to real capture rates."""
+    waveform = np.ones(160, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="between 8000 and 384000"):
         scorer.decode_request(_request(waveform, sample_rate=384_001))
-    with pytest.raises(ValueError, match="must not exceed"):
+    with pytest.raises(ValueError, match="between 8000 and 384000"):
         scorer.decode_request(_request(waveform, sample_rate=1_000_000))
 
 
-def test_audio_protocol_accepts_the_highest_standard_sample_rate(scorer):
+def test_audio_protocol_accepts_the_supported_sample_rate_range(scorer):
     waveform = np.ones(160, dtype=np.float32)
 
-    decoded, sample_rate, _, _ = scorer.decode_request(_request(waveform, sample_rate=384_000))
+    for rate in (8_000, 16_000, 24_000, 384_000):
+        decoded, accepted, _, _ = scorer.decode_request(_request(waveform, sample_rate=rate))
 
-    assert sample_rate == 384_000
-    assert decoded.size == 160
+        assert accepted == rate
+        assert decoded.size == 160
 
 
 def test_audio_protocol_requires_metadata(scorer):

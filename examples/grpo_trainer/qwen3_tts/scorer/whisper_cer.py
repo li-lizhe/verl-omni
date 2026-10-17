@@ -37,10 +37,13 @@ logger = logging.getLogger(__name__)
 # Device types that expose a torch.<device>.is_available() probe, in preference order.
 _ACCELERATOR_DEVICE_TYPES = ("cuda", "npu", "xpu", "mps")
 
-# Highest accepted input sample rate. Above any real capture rate (the highest
-# standard rates are 192 kHz and 384 kHz) and it bounds the resampling ratio: at
-# 8 MiB of float32 input the largest accepted rate still yields ~24x fewer than
-# 51 M output samples, instead of a sample_rate of 1 asking for ~16 G of them.
+# Accepted input sample rate range. The floor is what bounds the resampling
+# ratio, and therefore the resampled length: at 8 kHz the 16 kHz target is at
+# most a 2x expansion, so the 8 MiB HTTP body limit caps a request at ~4.2 M
+# output samples. A ceiling alone would not achieve this -- sample_rate=1 is
+# below any ceiling and asked for billions of output samples. The ceiling is the
+# input contract: the highest standard capture rates are 192 kHz and 384 kHz.
+_MIN_SAMPLE_RATE = 8_000
 _MAX_SAMPLE_RATE = 384_000
 
 
@@ -276,12 +279,14 @@ def decode_request(payload: Any) -> tuple[np.ndarray, int, str, dict]:
     if isinstance(num_samples, bool) or not isinstance(num_samples, int) or num_samples != waveform.size:
         raise ValueError(f"num_samples does not match the decoded waveform: {num_samples!r} != {waveform.size}.")
     sample_rate = payload.get("sample_rate")
-    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
-        raise ValueError(f"sample_rate must be a positive integer, got {sample_rate!r}.")
-    if sample_rate > _MAX_SAMPLE_RATE:
+    if (
+        isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or not _MIN_SAMPLE_RATE <= sample_rate <= _MAX_SAMPLE_RATE
+    ):
         raise ValueError(
-            f"sample_rate must not exceed {_MAX_SAMPLE_RATE} Hz (the highest standard capture "
-            f"rate), got {sample_rate!r}."
+            f"sample_rate must be an integer between {_MIN_SAMPLE_RATE} and {_MAX_SAMPLE_RATE} Hz, "
+            f"got {sample_rate!r}."
         )
     if not np.isfinite(waveform).all():
         raise ValueError("Decoded waveform contains NaN or infinity.")
