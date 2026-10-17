@@ -106,10 +106,17 @@ def _import_torchaudio_functional() -> Any:
 def linear_resample(samples: Any, source_rate: int, target_rate: int) -> Any:
     """Linearly resample a 1-D waveform on the samples' own device.
 
-    Used only when ``torchaudio`` is unavailable (Ascend/aarch64 hosts often ship
-    torch without a matching torchaudio wheel), so the scorer degrades instead of
-    failing to import. Kept in the input dtype on purpose: Ascend NPU lacks
-    float64 support.
+    Compatibility fallback used only when ``torchaudio`` is unavailable
+    (Ascend/aarch64 hosts often ship torch without a matching torchaudio wheel),
+    so the scorer degrades instead of failing to import. Kept in the input dtype
+    on purpose: Ascend NPU lacks float64 support.
+
+    This is not a band-limited resampler: downsampling can alias frequencies
+    above the target Nyquist limit and thus change the transcription and the CER
+    reward, and interpolation can introduce spectral images when upsampling. Use
+    ``torchaudio.functional.resample`` when band-limited rate conversion is
+    required; this path only avoids failing outright on hosts that cannot import
+    it.
     """
     import torch
 
