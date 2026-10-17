@@ -144,11 +144,17 @@ class _FakeDeviceType:
 
 
 class _FakeAccelerator:
-    def __init__(self, current):
+    def __init__(self, current, *, runtime_available=True):
         self._current = current
+        self._runtime_available = runtime_available
+        self.check_available_calls = []
 
-    def current_accelerator(self):
-        return self._current
+    def current_accelerator(self, check_available=False):
+        self.check_available_calls.append(check_available)
+        if not check_available:
+            # The compile-time answer, which ignores whether a device exists.
+            return self._current
+        return self._current if self._runtime_available else None
 
 
 class _FakeBackend:
@@ -191,6 +197,50 @@ def test_auto_device_falls_back_to_cpu_when_a_probe_raises(scorer):
     torch_module.cuda = _ExplodingBackend()
 
     assert scorer.resolve_auto_device(torch_module) == "cpu"
+
+
+def test_auto_device_uses_runtime_availability_not_the_compile_time_answer(scorer):
+    """A build compiled with CUDA on a host with no usable CUDA device must not
+    select ``cuda:0``; the compile-time answer alone is not enough."""
+    torch_module = _fake_torch(
+        accelerator=_FakeAccelerator(_FakeDeviceType("cuda"), runtime_available=False),
+        cuda=False,
+        npu=False,
+    )
+
+    assert scorer.resolve_auto_device(torch_module) == "cpu"
+
+
+def test_auto_device_supports_builds_without_the_check_available_kwarg(scorer):
+    """Older builds only accept a bare ``current_accelerator()``."""
+
+    class _NoKwargAccelerator:
+        def current_accelerator(self):
+            return _FakeDeviceType("npu")
+
+    torch_module = _fake_torch(accelerator=_NoKwargAccelerator(), npu=True)
+
+    assert scorer.resolve_auto_device(torch_module) == "npu:0"
+
+
+def test_torchaudio_native_load_failure_still_falls_back(scorer):
+    """``torchaudio`` may be installed while a native library fails to load, in
+    which case the import raises ``OSError`` rather than ``ImportError``."""
+
+    class _BrokenTorchaudio:
+        def find_spec(self, name, path=None, target=None):
+            if name == "torchaudio" or name.startswith("torchaudio."):
+                raise OSError("libtorchaudio.so: cannot open shared object file")
+            return None
+
+    for name in [key for key in list(sys.modules) if key.startswith("torchaudio")]:
+        del sys.modules[name]
+    broken = _BrokenTorchaudio()
+    sys.meta_path.insert(0, broken)
+    try:
+        assert scorer._import_torchaudio_functional() is None
+    finally:
+        sys.meta_path.remove(broken)
 
 
 def test_linear_resample_keeps_the_duration_and_interpolates_linearly(scorer):

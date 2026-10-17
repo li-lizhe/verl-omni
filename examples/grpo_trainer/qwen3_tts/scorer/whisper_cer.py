@@ -49,7 +49,15 @@ def resolve_auto_device(torch_module: Any) -> str:
     accelerator = getattr(torch_module, "accelerator", None)
     if accelerator is not None:
         try:
-            current = accelerator.current_accelerator()
+            # ``check_available=True`` adds the runtime check: without it a build
+            # compiled with CUDA answers ``cuda`` even when this host has no
+            # usable CUDA device, and the probes below would never be consulted.
+            current = accelerator.current_accelerator(check_available=True)
+        except TypeError:  # Builds whose current_accelerator() takes no kwarg.
+            try:
+                current = accelerator.current_accelerator()
+            except Exception:
+                current = None
         except Exception:  # Some torch builds raise instead of returning None.
             current = None
         current_type = getattr(current, "type", None)
@@ -66,6 +74,24 @@ def resolve_auto_device(torch_module: Any) -> str:
         if available:
             return f"{device_type}:0"
     return "cpu"
+
+
+def _import_torchaudio_functional() -> Any:
+    """Import ``torchaudio.functional``, or return ``None`` when it is unusable.
+
+    ``ImportError`` covers a missing wheel; ``OSError`` covers the case where
+    torchaudio *is* installed but a native component cannot be loaded.
+    ``torchaudio._extension._load_lib`` re-raises the underlying ``ctypes.DLL``
+    ``OSError`` as-is when the library file is found but cannot be loaded, so
+    catching only ``ImportError`` would miss exactly the situation this fallback
+    exists for. Ascend/aarch64 hosts hit both cases.
+    """
+    try:
+        import torchaudio.functional as audio_functional
+    except (ImportError, OSError):
+        logger.warning("torchaudio is unavailable; falling back to linear resampling.")
+        return None
+    return audio_functional
 
 
 def linear_resample(samples: Any, source_rate: int, target_rate: int) -> Any:
@@ -148,13 +174,7 @@ class WhisperCERScorer:
     def transcribe(self, waveform: np.ndarray, sample_rate: int) -> str:
         import torch
 
-        try:
-            import torchaudio.functional as audio_functional
-        except ImportError:
-            # Ascend/aarch64 hosts ship torch builds without a matching torchaudio
-            # wheel, so a hard dependency would make this scorer unusable there.
-            audio_functional = None
-            logger.warning("torchaudio is unavailable; falling back to linear resampling.")
+        audio_functional = _import_torchaudio_functional()
 
         samples = torch.from_numpy(waveform)
         if sample_rate != 16_000:
