@@ -38,16 +38,24 @@ logger = logging.getLogger(__name__)
 _ACCELERATOR_DEVICE_TYPES = ("cuda", "npu", "xpu", "mps")
 
 # Accepted input sample rate range. The floor is what bounds the resampling
-# ratio, and therefore the resampled length: at 8 kHz the 16 kHz target is at
-# most a 2x expansion, so the 8 MiB HTTP body limit caps a request at ~4.2 M
-# output samples. A ceiling alone would not achieve this -- sample_rate=1 is
+# ratio, and therefore the resampled length. The 8 MiB HTTP body carries a
+# base64 payload, so it decodes to at most ~6 MiB of float32 -- 1.57 M input
+# samples -- and an 8 kHz input is at most a 2x expansion, i.e. ~3.1 M output
+# samples (~12 MiB). A ceiling alone would not achieve this -- sample_rate=1 is
 # below any ceiling and asked for billions of output samples. The ceiling is the
 # input contract: the highest standard capture rates are 192 kHz and 384 kHz.
 _MIN_SAMPLE_RATE = 8_000
 _MAX_SAMPLE_RATE = 384_000
 
+# ``_import_torchaudio_functional`` is called per request, and a failed import is
+# not cached by ``sys.modules``. On the hosts this fallback targets (no torchaudio
+# wheel) every request would otherwise re-run the import machinery and re-log the
+# warning, so the outcome is memoized and the warning is emitted once.
+_TORCHAUDIO_FUNCTIONAL: Any = None
+_TORCHAUDIO_PROBED = False
 
-def resolve_auto_device(torch_module: Any) -> str:
+
+def _resolve_auto_device(torch_module: Any) -> str:
     """Resolve ``--device auto`` to the best available accelerator, else ``cpu``.
 
     ``torch.cuda.is_available()`` is ``False`` on non-CUDA accelerators such as
@@ -71,7 +79,10 @@ def resolve_auto_device(torch_module: Any) -> str:
             current = None
         current_type = getattr(current, "type", None)
         if current_type is not None and current_type != "cpu":
-            return f"{current_type}:0"
+            # ``current_accelerator()`` may report a non-zero index; keep it rather
+            # than forcing ``:0``.
+            index = getattr(current, "index", None)
+            return f"{current_type}:{index}" if index is not None else f"{current_type}:0"
     for device_type in _ACCELERATOR_DEVICE_TYPES:
         backend = getattr(torch_module, device_type, None)
         if backend is None:
@@ -94,16 +105,26 @@ def _import_torchaudio_functional() -> Any:
     ``OSError`` as-is when the library file is found but cannot be loaded, so
     catching only ``ImportError`` would miss exactly the situation this fallback
     exists for. Ascend/aarch64 hosts hit both cases.
+
+    The outcome is memoized: a failed import is not cached by ``sys.modules``, so
+    without this every ``transcribe()`` call on a torchaudio-less host would
+    re-run the import machinery and log the warning again.
     """
+    global _TORCHAUDIO_FUNCTIONAL, _TORCHAUDIO_PROBED
+
+    if _TORCHAUDIO_PROBED:
+        return _TORCHAUDIO_FUNCTIONAL
+    _TORCHAUDIO_PROBED = True
     try:
         import torchaudio.functional as audio_functional
     except (ImportError, OSError):
         logger.warning("torchaudio is unavailable; falling back to linear resampling.")
-        return None
-    return audio_functional
+        audio_functional = None
+    _TORCHAUDIO_FUNCTIONAL = audio_functional
+    return _TORCHAUDIO_FUNCTIONAL
 
 
-def linear_resample(samples: Any, source_rate: int, target_rate: int) -> Any:
+def _linear_resample(samples: Any, source_rate: int, target_rate: int) -> Any:
     """Linearly resample a 1-D waveform on the samples' own device.
 
     Compatibility fallback used only when ``torchaudio`` is unavailable
@@ -161,7 +182,7 @@ class WhisperCERScorer:
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
         if device == "auto":
-            device = resolve_auto_device(torch)
+            device = _resolve_auto_device(torch)
         dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
         if dtype not in dtype_map:
             raise ValueError(f"Unsupported dtype: {dtype!r}.")
@@ -197,7 +218,7 @@ class WhisperCERScorer:
             if audio_functional is not None:
                 samples = audio_functional.resample(samples, sample_rate, 16_000)
             else:
-                samples = linear_resample(samples, sample_rate, 16_000)
+                samples = _linear_resample(samples, sample_rate, 16_000)
         features = self.processor(
             samples.numpy(),
             sampling_rate=16_000,
