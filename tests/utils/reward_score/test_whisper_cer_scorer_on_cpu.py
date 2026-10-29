@@ -175,9 +175,15 @@ class _FakeDeviceType:
 
 
 class _FakeAccelerator:
-    def __init__(self, current, *, runtime_available=True):
+    """Models ``torch.accelerator``: ``current_accelerator()`` yields a device whose
+    index is unknown, and ``current_device_index()`` is where the index comes from."""
+
+    _UNSET = object()
+
+    def __init__(self, current, *, runtime_available=True, current_index=_UNSET):
         self._current = current
         self._runtime_available = runtime_available
+        self._current_index = current_index
         self.check_available_calls = []
 
     def current_accelerator(self, check_available=False):
@@ -186,6 +192,14 @@ class _FakeAccelerator:
             # The compile-time answer, which ignores whether a device exists.
             return self._current
         return self._current if self._runtime_available else None
+
+    def current_device_index(self):
+        # Real torch reports the index here; by default mirror the device shown.
+        if self._current_index is self._UNSET:
+            return self._current.index if self._current is not None and self._current.index is not None else 0
+        if isinstance(self._current_index, BaseException):
+            raise self._current_index
+        return self._current_index
 
 
 class _FakeBackend:
@@ -224,6 +238,12 @@ def _reset_torchaudio_probe(scorer):
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"))), "npu:0"),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu", 3))), "npu:3"),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cuda", 1))), "cuda:1"),
+        # ``current_accelerator()`` never carries an index in real torch; the index
+        # of the device in use has to come from ``current_device_index()``.
+        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=3)), "npu:3"),
+        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cuda"), current_index=2)), "cuda:2"),
+        # A build that raises from the accessor must not break device selection.
+        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=RuntimeError("no index"))), "npu:0"),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cpu")), cuda=False, npu=True), "npu:0"),
         (_fake_torch(cuda=True, npu=True), "cuda:0"),
         (_fake_torch(cuda=False, npu=False, xpu=True), "xpu:0"),

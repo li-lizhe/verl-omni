@@ -53,6 +53,34 @@ _MAX_SAMPLE_RATE = 384_000
 # warning, so the outcome is memoized and the warning is emitted once.
 _TORCHAUDIO_FUNCTIONAL: Any = None
 _TORCHAUDIO_PROBED = False
+# ``transcribe()`` runs on every ``ThreadingHTTPServer`` request thread, so the
+# probe has to be serialized: a second thread must not read the "not probed yet"
+# state while the first is still importing, and must never publish a result.
+_TORCHAUDIO_PROBE_LOCK = threading.Lock()
+
+
+def _current_index(accelerator: Any, current: Any) -> int:
+    """Index of the device ``auto`` should use for ``current``.
+
+    ``torch.accelerator.current_accelerator()`` documents that the returned
+    device carries **no** index -- it is always ``None`` -- and points at
+    :func:`torch.accelerator.current_device_index` for the one actually in use.
+    Defaulting to ``0`` would silently move a multi-device run onto the first
+    card, so ask the accelerator; a build without that accessor, or one that
+    fails, still has ``current``'s own index to fall back on, then ``0``.
+    """
+    index = getattr(current, "index", None)
+    if index is not None:
+        return index
+    current_device_index = getattr(accelerator, "current_device_index", None)
+    if callable(current_device_index):
+        try:
+            reported = current_device_index()
+        except Exception:  # Defensive: a probe must never break device selection.
+            reported = None
+        if isinstance(reported, int) and reported >= 0:
+            return reported
+    return 0
 
 
 def _resolve_auto_device(torch_module: Any) -> str:
@@ -79,10 +107,7 @@ def _resolve_auto_device(torch_module: Any) -> str:
             current = None
         current_type = getattr(current, "type", None)
         if current_type is not None and current_type != "cpu":
-            # ``current_accelerator()`` may report a non-zero index; keep it rather
-            # than forcing ``:0``.
-            index = getattr(current, "index", None)
-            return f"{current_type}:{index}" if index is not None else f"{current_type}:0"
+            return f"{current_type}:{_current_index(accelerator, current)}"
     for device_type in _ACCELERATOR_DEVICE_TYPES:
         backend = getattr(torch_module, device_type, None)
         if backend is None:
@@ -114,13 +139,21 @@ def _import_torchaudio_functional() -> Any:
 
     if _TORCHAUDIO_PROBED:
         return _TORCHAUDIO_FUNCTIONAL
-    _TORCHAUDIO_PROBED = True
-    try:
-        import torchaudio.functional as audio_functional
-    except (ImportError, OSError):
-        logger.warning("torchaudio is unavailable; falling back to linear resampling.")
-        audio_functional = None
-    _TORCHAUDIO_FUNCTIONAL = audio_functional
+    with _TORCHAUDIO_PROBE_LOCK:
+        # Another request may have finished the probe while this one waited.
+        if _TORCHAUDIO_PROBED:
+            return _TORCHAUDIO_FUNCTIONAL
+        try:
+            import torchaudio.functional as audio_functional
+        except (ImportError, OSError):
+            logger.warning("torchaudio is unavailable; falling back to linear resampling.")
+            audio_functional = None
+        # Publish the result first, then mark the probe done: a thread that sees
+        # ``_TORCHAUDIO_PROBED`` must never read an unassigned cache. An unexpected
+        # exception leaves the probe open (it is not caught here) so a later call
+        # retries instead of permanently falling back.
+        _TORCHAUDIO_FUNCTIONAL = audio_functional
+        _TORCHAUDIO_PROBED = True
     return _TORCHAUDIO_FUNCTIONAL
 
 
