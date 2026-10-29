@@ -23,7 +23,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
 
 @pytest.fixture(scope="module")
@@ -213,7 +212,10 @@ def _fake_torch(accelerator=None, **backends):
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=3)), "npu:3"),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cuda"), current_index=2)), "cuda:2"),
         # A build that raises from the accessor must not break device selection.
-        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=RuntimeError("no index"))), "npu:0"),
+        (
+            _fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=RuntimeError("no index"))),
+            "npu:0",
+        ),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cpu")), cuda=False, npu=True), "npu:0"),
         (_fake_torch(cuda=True, npu=True), "cuda:0"),
         (_fake_torch(cuda=False, npu=False, xpu=True), "xpu:0"),
