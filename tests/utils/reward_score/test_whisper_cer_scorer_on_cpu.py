@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 
 @pytest.fixture(scope="module")
@@ -79,6 +80,26 @@ def test_audio_protocol_fails_closed_on_length_mismatch(scorer):
 
     with pytest.raises(ValueError, match="does not match"):
         scorer.decode_request(payload)
+
+
+def test_audio_protocol_rejects_a_sample_rate_below_the_supported_floor(scorer):
+    """The floor is what bounds the resampling ratio: a rate of 1 Hz would ask
+    for thousands of output samples per input sample."""
+    waveform = np.ones(160, dtype=np.float32)
+
+    for rate in (1, 1_000, 7_999):
+        with pytest.raises(ValueError, match="between 8000 and 384000"):
+            scorer.decode_request(_request(waveform, sample_rate=rate))
+
+
+def test_audio_protocol_rejects_a_sample_rate_above_the_supported_ceiling(scorer):
+    """The ceiling keeps the accepted contract to real capture rates."""
+    waveform = np.ones(160, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="between 8000 and 384000"):
+        scorer.decode_request(_request(waveform, sample_rate=384_001))
+    with pytest.raises(ValueError, match="between 8000 and 384000"):
+        scorer.decode_request(_request(waveform, sample_rate=1_000_000))
 
 
 def test_audio_protocol_accepts_the_supported_sample_rate_range(scorer):
@@ -201,6 +222,16 @@ def _fake_torch(accelerator=None, **backends):
     return type("FakeTorch", (), attributes)()
 
 
+@pytest.fixture(autouse=True)
+def _reset_torchaudio_probe(scorer):
+    """The import probe is memoized module-wide; reset it so tests stay independent."""
+    scorer._TORCHAUDIO_PROBED = False
+    scorer._TORCHAUDIO_FUNCTIONAL = None
+    yield
+    scorer._TORCHAUDIO_PROBED = False
+    scorer._TORCHAUDIO_FUNCTIONAL = None
+
+
 @pytest.mark.parametrize(
     ("torch_module", "expected"),
     [
@@ -212,10 +243,7 @@ def _fake_torch(accelerator=None, **backends):
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=3)), "npu:3"),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cuda"), current_index=2)), "cuda:2"),
         # A build that raises from the accessor must not break device selection.
-        (
-            _fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=RuntimeError("no index"))),
-            "npu:0",
-        ),
+        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=RuntimeError("no index"))), "npu:0"),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cpu")), cuda=False, npu=True), "npu:0"),
         (_fake_torch(cuda=True, npu=True), "cuda:0"),
         (_fake_torch(cuda=False, npu=False, xpu=True), "xpu:0"),
@@ -258,3 +286,62 @@ def test_auto_device_supports_builds_without_the_check_available_kwarg(scorer):
     torch_module = _fake_torch(accelerator=_NoKwargAccelerator(), npu=True)
 
     assert scorer._resolve_auto_device(torch_module) == "npu:0"
+
+
+def test_torchaudio_native_load_failure_still_falls_back(scorer):
+    """``torchaudio`` may be installed while a native library fails to load, in
+    which case the import raises ``OSError`` rather than ``ImportError``."""
+
+    class _BrokenTorchaudio:
+        def find_spec(self, name, path=None, target=None):
+            if name == "torchaudio" or name.startswith("torchaudio."):
+                raise OSError("libtorchaudio.so: cannot open shared object file")
+            return None
+
+    for name in [key for key in list(sys.modules) if key.startswith("torchaudio")]:
+        del sys.modules[name]
+    broken = _BrokenTorchaudio()
+    sys.meta_path.insert(0, broken)
+    try:
+        assert scorer._import_torchaudio_functional() is None
+    finally:
+        sys.meta_path.remove(broken)
+
+
+def test_torchaudio_probe_is_memoized_across_calls(scorer):
+    """A failed import is not cached by ``sys.modules``, so the probe result has to
+    be memoized; otherwise every request re-imports and re-logs the warning."""
+    calls = []
+
+    class _BrokenTorchaudio:
+        def find_spec(self, name, path=None, target=None):
+            if name == "torchaudio" or name.startswith("torchaudio."):
+                calls.append(name)
+                raise OSError("libtorchaudio.so: cannot open shared object file")
+            return None
+
+    for name in [key for key in list(sys.modules) if key.startswith("torchaudio")]:
+        del sys.modules[name]
+    broken = _BrokenTorchaudio()
+    sys.meta_path.insert(0, broken)
+    try:
+        assert scorer._import_torchaudio_functional() is None
+        assert scorer._import_torchaudio_functional() is None
+    finally:
+        sys.meta_path.remove(broken)
+
+    assert len(calls) == 1
+
+
+def test_linear_resample_keeps_the_duration_and_interpolates_linearly(scorer):
+    samples = torch.arange(9, dtype=torch.float32)
+
+    upsampled = scorer._linear_resample(samples, 8_000, 16_000)
+    assert upsampled.shape == (18,)
+    torch.testing.assert_close(upsampled, torch.linspace(0.0, 8.0, 18))
+
+    downsampled = scorer._linear_resample(samples, 16_000, 8_000)
+    assert downsampled.shape == (5,)
+    torch.testing.assert_close(downsampled, torch.linspace(0.0, 8.0, 5))
+
+    assert scorer._linear_resample(samples, 16_000, 16_000) is samples
