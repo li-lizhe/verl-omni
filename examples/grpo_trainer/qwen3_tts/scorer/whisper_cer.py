@@ -108,7 +108,10 @@ def _resolve_auto_device(torch_module: Any) -> str:
         except Exception:  # Some torch builds raise instead of returning None.
             current = None
         current_type = getattr(current, "type", None)
-        if current_type is not None and current_type != "cpu":
+        # Only the types listed above are accepted: a backend that reports
+        # something else (mps on Apple silicon, say) must not be selected by
+        # ``auto`` -- naming it explicitly still works.
+        if current_type in _ACCELERATOR_DEVICE_TYPES:
             return f"{current_type}:{_current_index(accelerator, current)}"
     for device_type in _ACCELERATOR_DEVICE_TYPES:
         backend = getattr(torch_module, device_type, None)
@@ -348,8 +351,7 @@ def decode_request(payload: Any) -> tuple[np.ndarray, int, str, dict]:
         or not _MIN_SAMPLE_RATE <= sample_rate <= _MAX_SAMPLE_RATE
     ):
         raise ValueError(
-            f"sample_rate must be an integer between {_MIN_SAMPLE_RATE} and {_MAX_SAMPLE_RATE} Hz, "
-            f"got {sample_rate!r}."
+            f"sample_rate must be an integer between {_MIN_SAMPLE_RATE} and {_MAX_SAMPLE_RATE} Hz, got {sample_rate!r}."
         )
     if not np.isfinite(waveform).all():
         raise ValueError("Decoded waveform contains NaN or infinity.")

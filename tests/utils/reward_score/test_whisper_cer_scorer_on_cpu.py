@@ -243,12 +243,17 @@ def _reset_torchaudio_probe(scorer):
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=3)), "npu:3"),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cuda"), current_index=2)), "cuda:2"),
         # A build that raises from the accessor must not break device selection.
-        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=RuntimeError("no index"))), "npu:0"),
+        (
+            _fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("npu"), current_index=RuntimeError("no index"))),
+            "npu:0",
+        ),
         (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("cpu")), cuda=False, npu=True), "npu:0"),
         (_fake_torch(cuda=True, npu=True), "cuda:0"),
         (_fake_torch(cuda=False, npu=False, xpu=True), "xpu:0"),
-        # MPS is not probed: auto must never pick it on an Apple-silicon host.
+        # MPS is not probed: auto must never pick it on an Apple-silicon host,
+        # whether the accelerator reports it or only the backend probe does.
         (_fake_torch(cuda=False, npu=False, xpu=False, mps=True), "cpu"),
+        (_fake_torch(accelerator=_FakeAccelerator(_FakeDeviceType("mps")), mps=True), "cpu"),
         (_fake_torch(cuda=False, npu=False), "cpu"),
     ],
 )
@@ -288,47 +293,40 @@ def test_auto_device_supports_builds_without_the_check_available_kwarg(scorer):
     assert scorer._resolve_auto_device(torch_module) == "npu:0"
 
 
-def test_torchaudio_native_load_failure_still_falls_back(scorer):
-    """``torchaudio`` may be installed while a native library fails to load, in
-    which case the import raises ``OSError`` rather than ``ImportError``."""
+def _make_torchaudio_unimportable(monkeypatch, calls=None):
+    """Make every ``import torchaudio`` raise ``OSError``, restored by ``monkeypatch``.
+
+    ``torchaudio`` can be installed while a native library fails to load, in which
+    case the import raises ``OSError`` rather than ``ImportError``.
+    """
 
     class _BrokenTorchaudio:
         def find_spec(self, name, path=None, target=None):
             if name == "torchaudio" or name.startswith("torchaudio."):
+                if calls is not None:
+                    calls.append(name)
                 raise OSError("libtorchaudio.so: cannot open shared object file")
             return None
 
     for name in [key for key in list(sys.modules) if key.startswith("torchaudio")]:
-        del sys.modules[name]
-    broken = _BrokenTorchaudio()
-    sys.meta_path.insert(0, broken)
-    try:
-        assert scorer._import_torchaudio_functional() is None
-    finally:
-        sys.meta_path.remove(broken)
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(sys, "meta_path", [_BrokenTorchaudio(), *sys.meta_path])
 
 
-def test_torchaudio_probe_is_memoized_across_calls(scorer):
+def test_torchaudio_native_load_failure_still_falls_back(scorer, monkeypatch):
+    _make_torchaudio_unimportable(monkeypatch)
+
+    assert scorer._import_torchaudio_functional() is None
+
+
+def test_torchaudio_probe_is_memoized_across_calls(scorer, monkeypatch):
     """A failed import is not cached by ``sys.modules``, so the probe result has to
     be memoized; otherwise every request re-imports and re-logs the warning."""
     calls = []
+    _make_torchaudio_unimportable(monkeypatch, calls)
 
-    class _BrokenTorchaudio:
-        def find_spec(self, name, path=None, target=None):
-            if name == "torchaudio" or name.startswith("torchaudio."):
-                calls.append(name)
-                raise OSError("libtorchaudio.so: cannot open shared object file")
-            return None
-
-    for name in [key for key in list(sys.modules) if key.startswith("torchaudio")]:
-        del sys.modules[name]
-    broken = _BrokenTorchaudio()
-    sys.meta_path.insert(0, broken)
-    try:
-        assert scorer._import_torchaudio_functional() is None
-        assert scorer._import_torchaudio_functional() is None
-    finally:
-        sys.meta_path.remove(broken)
+    assert scorer._import_torchaudio_functional() is None
+    assert scorer._import_torchaudio_functional() is None
 
     assert len(calls) == 1
 
